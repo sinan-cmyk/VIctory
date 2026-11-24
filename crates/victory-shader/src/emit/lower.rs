@@ -3301,15 +3301,16 @@ impl<'a> Lower<'a> {
             None => vec![(2, field(self, 0))],
         };
         // Words HLSL cannot see: `GetDimensions` reads an image's sizes and
-        // levels (dwords 1-4) and a buffer's count (dword 2), and a structured
-        // buffer's stride (dword 1). Addresses (image 0, buffer 0 and 1),
-        // formats (buffer 3) and an image's array pitch and meta data (5-7)
-        // are not. Read as data they are refused, but at a join with data
-        // they are the stale register of a path that leaves the value
-        // undefined (see `fill_phis`).
+        // levels (dwords 1-4) and a buffer's count (dword 2). Addresses (image
+        // 0, buffer 0 and 1), formats (buffer 3) and an image's array pitch
+        // and meta data (5-7) are not. A structured buffer's dword 1 also
+        // holds its stride, which `GetDimensions` reads, but this function
+        // gives the word no value, and its low half is the address: it is
+        // hidden as for a raw view. Read as data they are refused, but at a
+        // join with data they are the stale register of a path that leaves
+        // the value undefined (see `fill_phis`).
         let hidden = |rel: u32| match image {
             Some(_) => matches!(rel, 0 | 5..=7),
-            None if props.0 & 0xFFF == 12 => matches!(rel, 0 | 3),
             None => matches!(rel, 0 | 1 | 3),
         };
         for k in 0..count {
