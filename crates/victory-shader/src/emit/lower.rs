@@ -3936,6 +3936,9 @@ impl<'a> Lower<'a> {
         };
         let use_at =
             uses(&|load| load == site).or_else(|| uses(&|load| self.twin_loads(site, load)));
+        // The element stride that word 2 counts in when the size comes from
+        // a raw view, which reports bytes.
+        let mut record_stride = None;
         let (first, src, props, image, uav) = if let Some((at, first)) = use_at {
             let src = Source::Loaded { load: site, first };
             let used = self.used_kind(&src);
@@ -3989,10 +3992,16 @@ impl<'a> Lower<'a> {
                     {
                         return Err("a scalar memory read as data");
                     }
+                    // The scalar loads read this slot through a raw view, so
+                    // the size query must use the same view: one slot that is
+                    // structured for one access and raw for the other reads
+                    // wrong on some hosts. The raw view reports bytes; word 2
+                    // of a structured descriptor counts records.
                     let stride = self
                         .scalar_srv_stride(&src, used)
                         .ok_or("a scalar memory read as data")?;
-                    ((12, stride), None)
+                    record_stride = Some(stride);
+                    ((11, 0), None)
                 }
                 _ => return Err("a scalar memory read as data"),
             };
@@ -4077,7 +4086,17 @@ impl<'a> Lower<'a> {
                 let d3 = self.s.m.bin(c, Bin::Or, base, last);
                 vec![(1, d1), (2, d2), (3, d3), (4, depth)]
             }
-            None => vec![(2, field(self, 0))],
+            None => {
+                let size = field(self, 0);
+                let size = match record_stride {
+                    Some(stride) => {
+                        let stride = self.s.m.i32(stride);
+                        self.s.m.bin(c, Bin::UDiv, size, stride)
+                    }
+                    None => size,
+                };
+                vec![(2, size)]
+            }
         };
         for k in 0..count {
             let rel = k.wrapping_sub(u32::from(first));
