@@ -41,6 +41,10 @@ type SrvMips = (usize, (u32, u32));
 /// bumps; overflowing falls back to a full `live_textures` walk once.
 const MAX_TEX_CHANGES: usize = 4096;
 
+/// Locks a heap's slots are spread over: slots in different stripes are
+/// remade at the same time ([`HostHeap::mirror`]).
+const SLOT_STRIPES: usize = 64;
+
 /// Live title-memory buffer range a heap slot views, for bindless refresh.
 /// The bool is whether the view is unordered (refresh must leave the host
 /// copy in unordered-access state, not generic-read).
@@ -174,7 +178,13 @@ pub(crate) struct HostHeap {
     spare: u32,
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
-    made: Mutex<Vec<u64>>,
+    /// Read without a lock (the scan in [`Self::sync_slots`] runs on every
+    /// bind of every recording thread); written under the slot's stripe.
+    made: Box<[AtomicU64]>,
+    /// Serialize remaking one slot ([`Self::mirror`]) while other slots are
+    /// made at the same time: one lock for the whole heap made every
+    /// recording thread wait for every other's view creation.
+    stripes: Box<[Mutex<()>]>,
     /// The host resource (or [`Shadow`]) each slot views, held while the slot
     /// does: shaders index heaps directly, so a slot the title has not
     /// rewritten since it released the resource may still be read, and a freed
@@ -389,7 +399,8 @@ impl HostHeap {
             count,
             spare: extra,
             sampler,
-            made: Mutex::new(vec![0; count as usize]),
+            made: (0..count).map(|_| AtomicU64::new(0)).collect(),
+            stripes: (0..SLOT_STRIPES).map(|_| Mutex::new(())).collect(),
             kept: Mutex::new((0..(count + extra)).map(|_| None).collect()),
             refreshes: Mutex::new(HashMap::new()),
             refresh_count: AtomicUsize::new(0),
@@ -899,13 +910,16 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
-        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let _slot = self.stripes[index as usize % SLOT_STRIPES]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let made = &self.made[index as usize];
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
-            if made[index as usize] != 0 {
-                made[index as usize] = 0;
+            if made.load(Ordering::Acquire) != 0 {
+                made.store(0, Ordering::Release);
                 self.make_null(index);
                 self.track_slot(index, None);
                 self.track_buffer(index, None);
@@ -914,16 +928,16 @@ impl HostHeap {
         };
         // A streamed texture's host SRV may have been narrowed to the levels
         // that had arrived; remake when more (or all) of them are there.
-        let widen = for_draw && !self.sampler && made[index as usize] == key && {
+        let widen = for_draw && !self.sampler && made.load(Ordering::Acquire) == key && {
             let map = self.srv_mips.lock().unwrap_or_else(|e| e.into_inner());
             match map.get(&index) {
                 Some(&(title, host)) => residency_widened(&view, title, host),
                 None => false,
             }
         };
-        if made[index as usize] != key || widen {
+        if made.load(Ordering::Acquire) != key || widen {
             let later = !for_draw && view.is_buffer();
-            made[index as usize] = if later { 0 } else { key };
+            made.store(if later { 0 } else { key }, Ordering::Release);
             let kept = if later {
                 None
             } else {
@@ -952,7 +966,7 @@ impl HostHeap {
             // Close the race with `descriptor::forget` running between the initial
             // `view_at` lookup and `track_slot` before this heap's publication.
             if new_entry.is_some() && view_at(i, generation).is_none() {
-                made[index as usize] = 0;
+                made.store(0, Ordering::Release);
                 self.make_null(index);
                 self.track_slot(index, None);
                 self.track_buffer(index, None);
@@ -980,7 +994,7 @@ impl HostHeap {
         }
         let mut changed = Vec::new();
         {
-            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let made = &self.made;
             for index in first..end {
                 let handle = start + u64::from(index) * step;
                 // SAFETY: `[first, end)` is bounded by `self.count` (which does
@@ -992,7 +1006,7 @@ impl HostHeap {
                 } else {
                     0
                 };
-                if made[index as usize] != expected {
+                if made[index as usize].load(Ordering::Acquire) != expected {
                     changed.push(index);
                 }
             }
@@ -1274,11 +1288,7 @@ impl HostHeap {
     /// a slot never made or left null.
     #[cfg(feature = "diagnostics")]
     pub(crate) fn describe_slot(&self, index: u32) -> Option<String> {
-        let key = *self
-            .made
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(index as usize)?;
+        let key = self.made.get(index as usize)?.load(Ordering::Acquire);
         if key == 0 {
             return Some("null".into());
         }
