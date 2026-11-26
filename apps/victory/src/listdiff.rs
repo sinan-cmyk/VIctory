@@ -162,9 +162,20 @@ fn report(d: &Diff, top: usize) -> String {
     s
 }
 
+fn read_listing(path: &Path) -> Result<String> {
+    let bytes = std::fs::read(path)?;
+    // Windows PowerShell 5.1 redirects native stdout as UTF-16LE with a BOM.
+    let Some(body) = bytes.strip_prefix(&[0xff, 0xfe]) else {
+        return Ok(String::from_utf8(bytes)?);
+    };
+    let (units, tail) = body.as_chunks::<2>();
+    anyhow::ensure!(tail.is_empty(), "truncated UTF-16LE code unit");
+    let units = units.iter().copied().map(u16::from_le_bytes);
+    Ok(char::decode_utf16(units).collect::<Result<String, _>>()?)
+}
+
 pub(crate) fn run(before: &Path, after: &Path, top: usize) -> Result<()> {
-    let read =
-        |p: &Path| std::fs::read_to_string(p).with_context(|| format!("reading {}", p.display()));
+    let read = |p: &Path| read_listing(p).with_context(|| format!("reading {}", p.display()));
     let (a, b) = (read(before)?, read(after)?);
     let (a, b) = (parse(&a), parse(&b));
     anyhow::ensure!(
@@ -295,6 +306,29 @@ x.rpf@0x70 new Gs  validated
         // A --top above the number of pairs prints them all, with no note.
         let r = report(&d, 5);
         assert!(r.contains("c  ->  d") && !r.contains("more pairs"), "{r}");
+    }
+
+    #[test]
+    fn windows_powershell_listings_work_in_either_position() {
+        let temp = std::env::temp_dir();
+        let pid = std::process::id();
+        let utf8 = temp.join(format!("victory-listdiff-utf8-{pid}.txt"));
+        let utf16 = temp.join(format!("victory-listdiff-utf16le-{pid}.txt"));
+        let listing = "synthetic Vs  emit: unknown symbol 𝛼\r\n";
+        std::fs::write(&utf8, format!("\u{feff}{listing}")).unwrap();
+        let mut bytes = vec![0xff, 0xfe];
+        bytes.extend(listing.encode_utf16().flat_map(u16::to_le_bytes));
+        std::fs::write(&utf16, bytes).unwrap();
+        assert_eq!(read_listing(&utf16).unwrap(), listing);
+        run(&utf8, &utf16, 1).unwrap();
+        run(&utf16, &utf8, 1).unwrap();
+
+        for bytes in [&[0xff, 0xfe, 0x61][..], &[0xff, 0xfe, 0x00, 0xd8], &[0x80]] {
+            std::fs::write(&utf16, bytes).unwrap();
+            let err = run(&utf8, &utf16, 1).unwrap_err();
+            assert_eq!(err.to_string(), format!("reading {}", utf16.display()));
+        }
+        let _ = (std::fs::remove_file(utf8), std::fs::remove_file(utf16));
     }
 
     #[test]
